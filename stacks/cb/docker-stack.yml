@@ -1,0 +1,283 @@
+version: "3.4"
+
+services:
+
+  phoenix-nats:
+    image: marineradmin/nats:dev
+    deploy:
+      replicas: 1
+      endpoint_mode: dnsrr
+      resources:
+        limits:
+          memory: 512M
+
+  elasticsearch1:
+    image: docker.elastic.co/elasticsearch/elasticsearch:5.4.0
+    environment:
+      - "network.host=0.0.0.0"
+      - "discovery.zen.ping.unicast.hosts=elasticsearch1"
+      - "discovery.zen.minimum_master_nodes=1"
+      - "cluster.name=cb2-cluster"
+      - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
+      - "xpack.security.enabled=false"
+    # volumes:
+    #   - "/cb2/es-data:/usr/share/elasticsearch/data"
+    deploy:
+      replicas: 1
+      endpoint_mode: dnsrr
+      resources:
+        limits:
+          memory: 1G
+        reservations:
+          memory: 1G
+
+  elastic-curator:
+    image: 'marineradmin/elastic-curator:dev'
+    environment:
+      ES_HOST: elasticsearch1
+      LOGGING_RETENTION_DAYS: 3    
+      ENTITY_ARCHIVE_RETENTION_DAYS: 7    
+      APP_METRICS_RETENTION_DAYS: 3    
+      METRICBEAT_RETENTION_DAYS: 3    
+    deploy:
+      replicas: 1
+
+  phoenix-rethinkdb:
+    image: marineradmin/rethinkdb:dev
+    command: ["bash", "/bin/rethinkdb.sh"]
+    # volumes:
+    # - "/cb2/rethinkdb-data:/data"    
+    deploy:
+      replicas: 1
+      endpoint_mode: dnsrr
+      resources:
+        limits:
+          memory: 1G
+
+  rethinkdb-admin:
+    image: rethinkdb:2.3.6
+    command: ["rethinkdb", "proxy", "--bind", "all", "--join", "phoenix-rethinkdb:29015"]
+    ports:
+    - '8080:8080'
+    deploy:
+      replicas: 1
+      # placement:
+      #   constraints: [node.labels.primary == true]
+      resources:
+        limits:
+          memory: 1G
+
+  nginx:
+    image: "marineradmin/nginx:dev"
+    configs:
+      - source: nginx-default-conf
+        target: /etc/nginx/conf.d/default.conf
+    ports:
+    - '80:80'
+    - '443:443'
+    - '9200:9200'
+    - '8222:8222'
+    deploy:
+      replicas: 1
+      # placement:
+      #   constraints: [node.labels.primary == true]
+
+  smtp:
+    image: "mwader/postfix-relay"
+    ports:
+    - 25:25    
+    deploy:
+      replicas: 1
+      # placement:
+      #   constraints: [node.labels.primary == true]
+
+  metricbeat:
+    image: marineradmin/docker-host-metricbeat:dev
+    pid: host
+    user: root
+    # network_mode: host  NOT SUPPORTED IN SWARM MODE
+    command: "metricbeat -e system.hostfs=/hostfs"
+    volumes:
+      - "/var/run/docker.sock:/var/run/docker.sock"
+      - "/proc:/hostfs/proc:ro"
+      - "/sys/fs/cgroup:/hostfs/sys/fs/cgroup:ro"
+      - "/:/hostfs:ro"
+    deploy:
+      replicas: 0
+
+  kibana:
+    image: docker.elastic.co/kibana/kibana:5.4.1
+    ports:
+      - "5601:5601"
+    environment:
+      - ELASTICSEARCH_URL=http://elasticsearch1:9200
+    deploy:
+      replicas: 1
+      # placement:
+      #   constraints: [node.labels.primary == true]
+
+  minio-1:
+    image: minio/minio
+    ports:
+      - 9000:9000
+    # volumes:
+    #   - /cb2/minio:/export
+    environment:
+      - "MINIO_ACCESS_KEY=SOME_ACCESS_KEY"
+      - "MINIO_SECRET_KEY=SOME_SECRET"
+    command: server /export
+    deploy:
+      replicas: 1
+      # placement:
+      #   constraints: [node.labels.primary == true]
+
+  app-gateway:
+    image: "marineradmin/app-gateway:dev"
+    entrypoint: "node --inspect=0.0.0.0:5861 server.js"
+    environment:
+    - "PORT=8001"
+    # ports:
+    # - 8001:8001
+    # - 5861:5861
+    working_dir: "/app"
+    deploy:
+      replicas: 1
+      # placement:
+      #   constraints: [node.labels.primary == true]
+
+  ecosystem:
+    image: "marineradmin/ecosystem:dev"
+    entrypoint: "node --inspect=0.0.0.0:0 server.js"
+    environment:
+    - "CB_APP_MESSAGING_SERVER=nats://phoenix-nats:4222"
+    # - "CB_APP_DEBUG_PORT=5870"
+    - "CB_APP_CLIENT_ID=c027a743-327b-4eff-9961-7537ff7f0f12"
+    - "CB_APP_CLIENT_SECRET=8a4a273f-e351-4ec3-9efe-2221d2d8f394"
+    - "RETHINKDB_SERVERS=phoenix-rethinkdb:28015"
+    # ports:
+    # - 5870:5870
+    working_dir: "/app"
+    deploy:
+      replicas: 1
+
+  integration-app:
+    image: "marineradmin/integration-app:dev"
+    entrypoint: "node --inspect=0.0.0.0:0 server.js"
+    # ports:
+    # - 5879:5879
+    environment:
+    - "CB_APP_MESSAGING_SERVER=nats://phoenix-nats:4222"
+    # - "CB_APP_DEBUG_PORT=5879"
+    - "CB_APP_CLIENT_ID=df516f60-190f-4e70-9520-9c12c121475a"
+    - "CB_APP_CLIENT_SECRET=363b4412-2f68-4769-8f49-c3606071a74c"
+    - FEED_ID=aishub
+    - MESSAGE_PARSER=nmea
+    - MESSAGE_TOPIC=source.sits.NAISReceiver
+    working_dir: "/app"
+    deploy:
+      replicas: 1
+
+  shapes-app:
+    image: "marineradmin/shapes-app:dev"
+    entrypoint: "node --inspect=0.0.0.0:0 server.js"
+    environment:
+    - "CB_APP_MESSAGING_SERVER=nats://phoenix-nats:4222"
+    # - "CB_APP_DEBUG_PORT=5875"
+    - "CB_APP_CLIENT_ID=6a8613dd-d1a2-4f80-ad7c-660de09cb83e"
+    - "CB_APP_CLIENT_SECRET=cb726765-fc11-4c73-800c-3e89dd3bd4fe"
+    # ports:
+    # - 5875:5875
+    working_dir: "/app"
+    deploy:
+      replicas: 1
+
+  archive-app:
+    image: "marineradmin/archive-app:dev"
+    entrypoint: "node --inspect=0.0.0.0:0 server.js"
+    environment:
+    - "CB_APP_MESSAGING_SERVER=nats://phoenix-nats:4222"
+    # - "CB_APP_DEBUG_PORT=5877"
+    - "CB_APP_CLIENT_ID=6fe45a60-d014-4646-8ff3-b18d968a978e"
+    - "CB_APP_CLIENT_SECRET=284c7df8-9bc1-4b1c-963a-c4074f533594"
+    # ports:
+    # - 5877:5877
+    working_dir: "/app"
+    deploy:
+      replicas: 1
+
+  mapgl-app:
+    image: "marineradmin/mapgl-app:dev"
+    entrypoint: "node --inspect=0.0.0.0:0 server.js"
+    environment:
+    - "CB_APP_MESSAGING_SERVER=nats://phoenix-nats:4222"
+    # - "CB_APP_DEBUG_PORT=5893"
+    - "CB_APP_CLIENT_ID=aae8e912-db8a-4501-a065-84445d72c4d6"
+    - "CB_APP_CLIENT_SECRET=3b64a308-55b6-4d6e-9a06-3078b138e376"
+    # ports:
+    # - 5893:5893
+    working_dir: "/app"
+    deploy:
+      replicas: 1
+
+  rules-app:
+    image: "marineradmin/rules-app:dev"
+    entrypoint: "node --inspect=0.0.0.0:0 server.js"
+    environment:
+    - "CB_APP_MESSAGING_SERVER=nats://phoenix-nats:4222"
+    # - "CB_APP_DEBUG_PORT=5896"
+    - "CB_APP_CLIENT_ID=b78360a7-5512-4f1b-a3aa-35e594ae8074"
+    - "CB_APP_CLIENT_SECRET=94881efe-146b-4e6a-a15b-9a28e192af89"
+    # ports:
+    # - 5896:5896
+    working_dir: "/app"
+    deploy:
+      replicas: 1
+
+  settings-app:
+    image: "marineradmin/orion-settings:dev"
+    entrypoint: "node --inspect=0.0.0.0:0 server.js"
+    environment:
+    - "CB_APP_MESSAGING_SERVER=nats://phoenix-nats:4222"
+    # - "CB_APP_DEBUG_PORT=5897"
+    - "CB_APP_CLIENT_ID=4db14457-7993-4f6a-a822-ca51dba20f72"
+    - "CB_APP_CLIENT_SECRET=024eaa3d-f963-4427-a0b2-0fba6579f3a9"
+    # ports:
+    # - 5897:5897
+    working_dir: "/app"
+    deploy:
+      replicas: 1
+
+  reports-app:
+    image: "marineradmin/reports-app:dev"
+    entrypoint: "node --inspect=0.0.0.0:0 server.js"
+    environment:
+    - "CB_APP_MESSAGING_SERVER=nats://phoenix-nats:4222"
+    # - "CB_APP_DEBUG_PORT=5895"
+    - "CB_APP_CLIENT_ID=1f284649-4160-4dd9-a913-58cdcc175216"
+    - "CB_APP_CLIENT_SECRET=2322f61b-15f0-4001-b891-88cc7ffbd129"
+    # ports:
+    # - 5895:5895
+    working_dir: "/app"
+    deploy:
+      replicas: 1
+
+  process-manager:
+    image: "marineradmin/process-manager:dev"
+    entrypoint: "node --inspect=0.0.0.0:0 server.js"
+    environment:
+    - "CB_APP_MESSAGING_SERVER=nats://phoenix-nats:4222"
+    # - "CB_APP_DEBUG_PORT=5898"
+    - "CB_APP_CLIENT_ID=5fca14a3-772c-4de5-8dfd-849afc12343c"
+    - "CB_APP_CLIENT_SECRET=5f3a7bbe-35fb-4a88-b588-156b34126566"
+    # ports:
+    # - 5898:5898
+    working_dir: "/app"
+    deploy:
+      replicas: 1
+configs:
+  nginx-default-conf:
+    external: true
+# networks: NOT NECESSARY ALL IN SMAE FILE SO ON SAME DEFAULT NETWORK
+#   default:
+#     external:
+#       name: cbnet
